@@ -1,0 +1,203 @@
+name: Build APK
+
+# Android project ko APK me badalne wala workflow.
+#
+# Kab chalta hai:
+#   - Actions tab > "Build APK" > Run workflow (haath se)
+#   - repo me kuch bhi upload/push karte hi (apne aap)
+#
+# Project repo me kahin bhi ho chalega, apne aap dhoondh leta hai:
+#   1. repo ke root me (settings.gradle.kts wahin ho)
+#   2. kisi folder ke andar (jaise PinSettings/settings.gradle.kts)
+#   3. poori project .zip repo me upload ki ho (workflow khud khol leta hai)
+#
+# APK kahan milegi: run poora hone par run page ke neeche "Artifacts" me.
+# Seedha .apk download hoti hai, zip nahi.
+#
+# Optional: repo me `debug.keystore` daal do to har build ek hi key se sign hogi
+# aur naya APK purane ke upar update ho jayega (device owner app ke liye zaroori).
+
+on:
+  workflow_dispatch:
+  push:
+
+# Naya run shuru hote hi usi branch ka purana run band ho jata hai.
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # .zip chunne ke liye commit history chahiye
+          persist-credentials: false
+
+      - name: Find Gradle project
+        id: proj
+        run: |
+          set -eu
+
+          # settings.gradle(.kts) dhoondo. Jo sabse upar ke folder me ho wahi project hai.
+          find_project() {
+            find "$1" -maxdepth "$2" -type f \( -name settings.gradle.kts -o -name settings.gradle \) \
+              -not -path '*/.git/*' -not -path '*/__MACOSX/*' -not -path '*/build/*' \
+              | awk -F/ '{ print NF "\t" $0 }' | sort -n | sed -n '1p' | cut -f2-
+          }
+
+          settings=$(find_project . 3)
+
+          if [ -z "$settings" ]; then
+            echo "Folder me project nahi mila, .zip dhoondh raha hu..."
+            zip=""
+            newest=0
+            # Sabse naye commit wali .zip lo (barabar ho to bada version number).
+            while IFS= read -r -d '' f; do
+              t=$(git log -1 --format=%ct -- "$f")
+              if [ "$t" -ge "$newest" ]; then
+                zip="$f"
+                newest="$t"
+              fi
+            done < <(git ls-files -z -- '*.zip' | sort -z -V)
+
+            if [ -z "$zip" ]; then
+              echo "::error::Repo me Gradle project (settings.gradle.kts) nahi mila, aur koi .zip bhi nahi. Project ki saari files ya poori .zip repo me upload karo."
+              exit 1
+            fi
+
+            echo "Project .zip se nikal raha hu: $zip"
+            dest="$RUNNER_TEMP/src"
+            rm -rf "$dest"
+            mkdir -p "$dest"
+            rc=0
+            unzip -q -o "$zip" -d "$dest" -x '__MACOSX/*' || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::'$zip' khul nahi paayi (unzip code $rc). Zip kharab ho sakti hai."
+              exit 1
+            fi
+            settings=$(find_project "$dest" 4)
+            if [ -z "$settings" ]; then
+              echo "::error::'$zip' ke andar settings.gradle.kts nahi mila. Poora project zip karke daalo."
+              exit 1
+            fi
+          fi
+
+          dir=$(cd "$(dirname "$settings")" && pwd)
+          echo "Project folder: $dir"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.7' # project me gradlew nahi hai, isliye Gradle yahin se aati hai
+          cache-provider: basic # open-source cache, public aur private dono repo ke liye free
+
+      - name: Accept Android SDK licenses
+        run: |
+          # SDK ka koi hissa download karna pade to license ki wajah se build na ruke.
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+
+      - name: Use fixed signing key (if debug.keystore exists)
+        id: sign
+        env:
+          PROJ: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -eu
+
+          ks=""
+          for c in "$PROJ/debug.keystore" "$GITHUB_WORKSPACE/debug.keystore"; do
+            if [ -f "$c" ]; then
+              ks="$c"
+              break
+            fi
+          done
+
+          if [ -z "$ks" ]; then
+            echo "fixed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::debug.keystore nahi mili. Har build ki signing key alag hogi, isliye naya APK purane ke upar install nahi hoga (pehle purana app hatana padega). Repo me debug.keystore daal do."
+            exit 0
+          fi
+
+          mkdir -p "$HOME/.android"
+          cp "$ks" "$HOME/.android/debug.keystore"
+          if ! keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey > /dev/null 2>&1; then
+            echo "::error::debug.keystore sahi nahi hai. Uska alias 'androiddebugkey' aur password 'android' hona chahiye."
+            exit 1
+          fi
+          echo "fixed=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::debug.keystore use ho rahi hai: har build same key se sign hogi."
+
+      - name: Build debug APK
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Name the APK
+        id: apk
+        env:
+          PROJ: ${{ steps.proj.outputs.dir }}
+          FIXED_KEY: ${{ steps.sign.outputs.fixed }}
+        run: |
+          set -eu
+
+          apk=$(find "$PROJ" -type f -path '*/build/outputs/apk/debug/*.apk' | sed -n '1p')
+          if [ -z "$apk" ]; then
+            echo "::error::Build ke baad debug APK nahi mili (build/outputs/apk/debug me)."
+            exit 1
+          fi
+          moddir="${apk%/build/outputs/apk/debug/*}"
+
+          # Naam: <project>-v<versionName>-build<versionCode>-debug.apk
+          name=$(cat "$PROJ"/settings.gradle* 2>/dev/null | sed -n 's/.*rootProject\.name *= *"\([^"]*\)".*/\1/p' | sed -n '1p')
+          vname=$(cat "$moddir"/build.gradle* 2>/dev/null | sed -n 's/.*versionName *=\{0,1\} *"\([^"]*\)".*/\1/p' | sed -n '1p')
+          vcode=$(cat "$moddir"/build.gradle* 2>/dev/null | sed -n 's/.*versionCode *=\{0,1\} *\([0-9][0-9]*\).*/\1/p' | sed -n '1p')
+
+          if [ -z "$name" ]; then
+            name=$(basename "$moddir")
+          fi
+          fname="$name"
+          if [ -n "$vname" ]; then
+            fname="$fname-v$vname"
+          fi
+          if [ -n "$vcode" ]; then
+            fname="$fname-build$vcode"
+          fi
+          fname=$(printf '%s' "$fname-debug.apk" | tr -c 'A-Za-z0-9._-' '_')
+
+          mkdir -p "$RUNNER_TEMP/dist"
+          cp "$apk" "$RUNNER_TEMP/dist/$fname"
+          echo "path=$RUNNER_TEMP/dist/$fname" >> "$GITHUB_OUTPUT"
+
+          size=$(du -h --apparent-size "$RUNNER_TEMP/dist/$fname" | cut -f1)
+          if [ "$FIXED_KEY" = "true" ]; then
+            signing="fixed key (debug.keystore): naya APK purane ke upar update ho jayega"
+          else
+            signing="har build ki alag key: naya APK install karne se pehle purana app hatana padega"
+          fi
+          {
+            echo "### APK taiyar: \`$fname\` ($size)"
+            echo ""
+            echo "- Neeche **Artifacts** me isi naam ki file hai. Tap karo, seedha .apk download hoti hai (zip nahi)."
+            echo "- Signing: $signing"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.apk.outputs.path }}
+          archive: false # zip nahi, seedha .apk download ho
+          if-no-files-found: error
